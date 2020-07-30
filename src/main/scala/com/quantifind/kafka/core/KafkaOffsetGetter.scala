@@ -10,7 +10,6 @@ import com.morningstar.kafka.KafkaOffsetMetadata
 import com.morningstar.kafka.KafkaOffsetStorage
 import com.morningstar.kafka.KafkaTopicPartition
 import com.morningstar.kafka.KafkaTopicPartitionLogEndOffset
-
 import com.quantifind.kafka.OffsetGetter.OffsetInfo
 import com.quantifind.kafka.offsetapp.OffsetGetterArgs
 import com.quantifind.kafka.{Node, OffsetGetter}
@@ -18,7 +17,7 @@ import com.quantifind.utils.ZkUtilsWrapper
 import com.twitter.util.Time
 import kafka.admin.AdminClient
 import kafka.common.{KafkaException, OffsetAndMetadata, TopicAndPartition}
-import kafka.coordinator._
+import kafka.coordinator.{BaseKey, GroupTopicPartition, OffsetKey, _}
 import kafka.utils.Logging
 import org.apache.kafka.clients.CommonClientConfigs
 import org.apache.kafka.clients.consumer._
@@ -180,6 +179,64 @@ class KafkaOffsetGetter(zkUtilsWrapper: ZkUtilsWrapper, args: OffsetGetterArgs) 
 }
 
 object KafkaOffsetGetter extends Logging {
+	import java.nio.ByteBuffer
+	import org.apache.kafka.common.protocol.types.Type.{INT32, INT64, STRING}
+	import org.apache.kafka.common.protocol.types.{Field, Schema, Struct}
+	private case class KeyAndValueSchemas(keySchema: Schema, valueSchema: Schema)
+	private val OFFSET_COMMIT_KEY_SCHEMA_V0 = new Schema(new Field("group", STRING),
+		new Field("topic", STRING),
+		new Field("partition", INT32))
+	private val KEY_GROUP_FIELD = OFFSET_COMMIT_KEY_SCHEMA_V0.get("group")
+	private val KEY_TOPIC_FIELD = OFFSET_COMMIT_KEY_SCHEMA_V0.get("topic")
+	private val KEY_PARTITION_FIELD = OFFSET_COMMIT_KEY_SCHEMA_V0.get("partition")
+	private val OFFSET_COMMIT_VALUE_SCHEMA_V0 = new Schema(new Field("offset", INT64),
+		new Field("metadata", STRING, "Associated metadata.", ""),
+		new Field("timestamp", INT64))
+	private val OFFSET_COMMIT_VALUE_SCHEMA_V1 = new Schema(new Field("offset", INT64),
+		new Field("metadata", STRING, "Associated metadata.", ""),
+		new Field("commit_timestamp", INT64),
+		new Field("expire_timestamp", INT64))
+	private val OFFSET_COMMIT_VALUE_SCHEMA_V2 = new Schema(new Field("offset", INT64),
+		new Field("metadata", STRING, "Associated metadata.", ""),
+		new Field("commit_timestamp", INT64))
+	private val OFFSET_COMMIT_VALUE_SCHEMA_V3 = new Schema(new Field("offset", INT64),
+		new Field("leader_epoch", INT32),
+		new Field("metadata", STRING, "Associated metadata.", ""),
+		new Field("commit_timestamp", INT64))
+	private val VALUE_OFFSET_FIELD_V0 = OFFSET_COMMIT_VALUE_SCHEMA_V0.get("offset")
+	private val VALUE_METADATA_FIELD_V0 = OFFSET_COMMIT_VALUE_SCHEMA_V0.get("metadata")
+	private val VALUE_TIMESTAMP_FIELD_V0 = OFFSET_COMMIT_VALUE_SCHEMA_V0.get("timestamp")
+	private val VALUE_OFFSET_FIELD_V1 = OFFSET_COMMIT_VALUE_SCHEMA_V1.get("offset")
+	private val VALUE_METADATA_FIELD_V1 = OFFSET_COMMIT_VALUE_SCHEMA_V1.get("metadata")
+	private val VALUE_COMMIT_TIMESTAMP_FIELD_V1 = OFFSET_COMMIT_VALUE_SCHEMA_V1.get("commit_timestamp")
+	private val VALUE_OFFSET_FIELD_V2 = OFFSET_COMMIT_VALUE_SCHEMA_V2.get("offset")
+	private val VALUE_METADATA_FIELD_V2 = OFFSET_COMMIT_VALUE_SCHEMA_V2.get("metadata")
+	private val VALUE_COMMIT_TIMESTAMP_FIELD_V2 = OFFSET_COMMIT_VALUE_SCHEMA_V2.get("commit_timestamp")
+	private val VALUE_OFFSET_FIELD_V3 = OFFSET_COMMIT_VALUE_SCHEMA_V3.get("offset")
+	private val VALUE_LEADER_EPOCH_FIELD_V3 = OFFSET_COMMIT_VALUE_SCHEMA_V3.get("leader_epoch")
+	private val VALUE_METADATA_FIELD_V3 = OFFSET_COMMIT_VALUE_SCHEMA_V3.get("metadata")
+	private val VALUE_COMMIT_TIMESTAMP_FIELD_V3 = OFFSET_COMMIT_VALUE_SCHEMA_V3.get("commit_timestamp")
+	// private val VALUE_EXPIRE_TIMESTAMP_FIELD_V1 = OFFSET_COMMIT_VALUE_SCHEMA_V1.get("expire_timestamp")
+	// map of versions to schemas
+	private val OFFSET_SCHEMAS = Map(0 -> KeyAndValueSchemas(OFFSET_COMMIT_KEY_SCHEMA_V0, OFFSET_COMMIT_VALUE_SCHEMA_V0),
+	1 -> KeyAndValueSchemas(OFFSET_COMMIT_KEY_SCHEMA_V0, OFFSET_COMMIT_VALUE_SCHEMA_V1),
+	2 -> KeyAndValueSchemas(OFFSET_COMMIT_KEY_SCHEMA_V0, OFFSET_COMMIT_VALUE_SCHEMA_V2),
+	3 -> KeyAndValueSchemas(OFFSET_COMMIT_KEY_SCHEMA_V0, OFFSET_COMMIT_VALUE_SCHEMA_V3))
+	private def schemaFor(version: Int) = {
+		val schemaOpt = OFFSET_SCHEMAS.get(version)
+		schemaOpt match {
+			case Some(schema) => schema
+			case _ => throw new RuntimeException("Unknown offset schema version " + version)
+		}
+	}
+	case class MessageValueStructAndVersion(value: Struct, version: Short)
+	case class TopicAndGroup(topic: String, group: String)
+	//case class GroupTopicPartition(group: String, topicPartition: TopicAndPartition) {
+	//	def this(group: String, topic: String, partition: Int) =
+	//		this(group, new TopicAndPartition(topic, partition))
+	//	override def toString =
+	//		"[%s,%s,%d]".format(group, topicPartition.topic, topicPartition.partition)
+	//}
 
 	val committedOffsetMap: concurrent.Map[GroupTopicPartition, OffsetAndMetadata] = concurrent.TrieMap()
 	val logEndOffsetsMap: concurrent.Map[TopicPartition, Long] = concurrent.TrieMap()
@@ -262,7 +319,7 @@ object KafkaOffsetGetter extends Logging {
 				return None
 			}
 
-			val baseKey: BaseKey = GroupMetadataManager.readMessageKey(ByteBuffer.wrap(message.key))
+			val baseKey: BaseKey = readMessageKey(ByteBuffer.wrap(message.key))
 
 			// Match on the key to see if the message is an offset message
 			baseKey match {
@@ -274,7 +331,7 @@ object KafkaOffsetGetter extends Logging {
 					if (messageBody != null) {
 
 						val gtp: GroupTopicPartition = b.key
-						val offsetAndMetadata: OffsetAndMetadata = GroupMetadataManager.readOffsetMessageValue(ByteBuffer.wrap(messageBody))
+						val offsetAndMetadata: OffsetAndMetadata = readMessageValue(ByteBuffer.wrap(messageBody))
 						return Option(gtp, offsetAndMetadata)
 					}
 					else {
@@ -301,6 +358,68 @@ object KafkaOffsetGetter extends Logging {
 				val errorMsg = String.format("An unhandled exception was thrown while attempting to determine the validity of a message as an offset message. This message will be ignored.")
 				error(errorMsg, e)
 				return None
+		}
+	}
+
+	/**
+		* Decodes the offset messages' key
+		*
+		* @param buffer input byte-buffer
+		* @return an GroupTopicPartition object
+		*/
+	private def readMessageKey(buffer: ByteBuffer): BaseKey = {
+		val version = buffer.getShort()
+		val keySchema = schemaFor(version).keySchema
+		val key = keySchema.read(buffer).asInstanceOf[Struct]
+		val group = key.get(KEY_GROUP_FIELD).asInstanceOf[String]
+		val topic = key.get(KEY_TOPIC_FIELD).asInstanceOf[String]
+		val partition = key.get(KEY_PARTITION_FIELD).asInstanceOf[Int]
+		OffsetKey(version, GroupTopicPartition(group, TopicAndPartition(topic, partition)))
+	}
+	private def readMessageValue(buffer: ByteBuffer): OffsetAndMetadata = {
+		val structAndVersion = readMessageValueStruct(buffer)
+		if (structAndVersion.value == null) { // tombstone
+			null
+		} else {
+			if (structAndVersion.version == 0) {
+				val offset = structAndVersion.value.get(VALUE_OFFSET_FIELD_V0).asInstanceOf[Long]
+				val metadata = structAndVersion.value.get(VALUE_METADATA_FIELD_V0).asInstanceOf[String]
+				val timestamp = structAndVersion.value.get(VALUE_TIMESTAMP_FIELD_V0).asInstanceOf[Long]
+				OffsetAndMetadata(offset, metadata, timestamp)
+			} else if (structAndVersion.version == 1) {
+				val offset = structAndVersion.value.get(VALUE_OFFSET_FIELD_V1).asInstanceOf[Long]
+				val metadata = structAndVersion.value.get(VALUE_METADATA_FIELD_V1).asInstanceOf[String]
+				val commitTimestamp = structAndVersion.value.get(VALUE_COMMIT_TIMESTAMP_FIELD_V1).asInstanceOf[Long]
+				// not supported in 0.8.2
+				// val expireTimestamp = structAndVersion.value.get(VALUE_EXPIRE_TIMESTAMP_FIELD_V1).asInstanceOf[Long]
+				OffsetAndMetadata(offset, metadata, commitTimestamp, commitTimestamp)
+			} else if (structAndVersion.version == 2) {
+				val offset = structAndVersion.value.get(VALUE_OFFSET_FIELD_V2).asInstanceOf[Long]
+				val metadata = structAndVersion.value.get(VALUE_METADATA_FIELD_V2).asInstanceOf[String]
+				val commitTimestamp = structAndVersion.value.get(VALUE_COMMIT_TIMESTAMP_FIELD_V2).asInstanceOf[Long]
+				// not supported in 0.8.2
+				// val expireTimestamp = structAndVersion.value.get(VALUE_EXPIRE_TIMESTAMP_FIELD_V1).asInstanceOf[Long]
+				OffsetAndMetadata(offset, metadata, commitTimestamp, commitTimestamp)
+			}else if(structAndVersion.version == 3){
+				val offset = structAndVersion.value.get(VALUE_OFFSET_FIELD_V3).asInstanceOf[Long]
+				val metadata = structAndVersion.value.get(VALUE_METADATA_FIELD_V3).asInstanceOf[String]
+				val commitTimestamp = structAndVersion.value.get(VALUE_COMMIT_TIMESTAMP_FIELD_V3).asInstanceOf[Long]
+				// not supported in 0.8.2
+				//val expireTimestamp = structAndVersion.value.get(VALUE_EXPIRE_TIMESTAMP_FIELD_V3).asInstanceOf[Long]
+				OffsetAndMetadata(offset, metadata, commitTimestamp, commitTimestamp)
+			} else {
+				throw new IllegalStateException("Unknown offset message version: " + structAndVersion.version)
+			}
+		}
+	}
+	private def readMessageValueStruct(buffer: ByteBuffer): MessageValueStructAndVersion = {
+		if(buffer == null) { // tombstone
+			MessageValueStructAndVersion(null, -1)
+		} else {
+			val version = buffer.getShort()
+			val valueSchema = schemaFor(version).valueSchema
+			val value = valueSchema.read(buffer).asInstanceOf[Struct]
+			MessageValueStructAndVersion(value, version)
 		}
 	}
 

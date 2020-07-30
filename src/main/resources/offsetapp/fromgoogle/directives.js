@@ -106,7 +106,7 @@ angular.module("offsetapp.directives", [])
 								type: 'minute',
 								count: 1,
 								text: '1m'
-							},{
+							}, {
 								type: 'minute',
 								count: 5,
 								text: '5m'
@@ -130,7 +130,7 @@ angular.module("offsetapp.directives", [])
 								type: 'day',
 								count: 5,
 								text: '5d'
-							},{
+							}, {
 								type: 'all',
 								text: 'All'
 							}]
